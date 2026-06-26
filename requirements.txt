@@ -1,4 +1,6 @@
 fastapi
-uvicorn
-pydantic
+uvicorn[standard]
+pydantic[email]
 psycopg2-binary
+passlib[bcrypt]
+fastapi-mail
