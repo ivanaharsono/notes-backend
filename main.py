@@ -7,23 +7,19 @@ import psycopg2
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from passlib.context import CryptContext
+import bcrypt
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 
 # =========================================================================
 # KONFIGURASI
-# Semua kunci rahasia diambil dari Environment Variables (Settings > Secrets
-# di Hugging Face). JANGAN hardcode di sini.
 # =========================================================================
-DATABASE_URL = os.environ.get("DATABASE_URL")          # connection string Neon
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")            # tujuan email feedback
+DATABASE_URL = os.environ.get("DATABASE_URL")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
 OTP_EXPIRE_MINUTES = 5
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 mail_conf = ConnectionConfig(
     MAIL_USERNAME=os.environ.get("MAIL_USERNAME"),
-    MAIL_PASSWORD=os.environ.get("MAIL_PASSWORD"),     # App Password Gmail (16 digit)
+    MAIL_PASSWORD=os.environ.get("MAIL_PASSWORD"),
     MAIL_FROM=os.environ.get("MAIL_FROM", os.environ.get("MAIL_USERNAME", "noreply@example.com")),
     MAIL_PORT=int(os.environ.get("MAIL_PORT", 587)),
     MAIL_SERVER=os.environ.get("MAIL_SERVER", "smtp.gmail.com"),
@@ -45,7 +41,6 @@ def get_db_connection():
 
 
 def run_query(query, params=(), fetch=None):
-    """Helper kecil biar koneksi selalu ketutup. fetch: 'one' | 'all' | None."""
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -63,7 +58,6 @@ def run_query(query, params=(), fetch=None):
 
 
 def init_db():
-    """Bikin tabel kalau belum ada. Aman dijalankan berkali-kali."""
     if not DATABASE_URL:
         print("[WARN] DATABASE_URL kosong, init_db dilewati.")
         return
@@ -82,18 +76,27 @@ def init_db():
             id SERIAL PRIMARY KEY,
             email VARCHAR(150) NOT NULL,
             code VARCHAR(6) NOT NULL,
-            purpose VARCHAR(20) NOT NULL,   -- 'signup' atau 'reset'
+            purpose VARCHAR(20) NOT NULL,
             expires_at TIMESTAMP NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # Jaga-jaga kalau tabel users lama belum punya kolom is_verified
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;")
 
 
 # =========================================================================
-# UTIL
+# UTIL & SECURITY (BCRYPT DIRECT)
 # =========================================================================
+def hash_password(password: str) -> str:
+    # Memastikan format UTF-8 dan memotong ke limit 72 byte agar tidak bentrok dengan aturan bcrypt
+    password_bytes = password.encode('utf-8')[:72]
+    hashed_bytes = bcrypt.hashpw(password_bytes, bcrypt.gensalt())
+    return hashed_bytes.decode('utf-8')
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    plain_bytes = plain_password.encode('utf-8')[:72]
+    return bcrypt.checkpw(plain_bytes, hashed_password.encode('utf-8'))
+
 def generate_otp() -> str:
     return f"{secrets.randbelow(1_000_000):06d}"
 
@@ -101,7 +104,6 @@ def generate_otp() -> str:
 def save_otp(email: str, purpose: str) -> str:
     code = generate_otp()
     expires = datetime.utcnow() + timedelta(minutes=OTP_EXPIRE_MINUTES)
-    # Hapus OTP lama untuk tujuan yang sama, lalu simpan yang baru
     run_query("DELETE FROM otp_codes WHERE email = %s AND purpose = %s", (email, purpose))
     run_query(
         "INSERT INTO otp_codes (email, code, purpose, expires_at) VALUES (%s, %s, %s, %s)",
@@ -118,10 +120,9 @@ def verify_otp(email: str, code: str, purpose: str) -> bool:
     )
     if not row:
         return False
-    if row[0] < datetime.utcnow():           # kedaluwarsa
+    if row[0] < datetime.utcnow():
         run_query("DELETE FROM otp_codes WHERE email = %s AND purpose = %s", (email, purpose))
         return False
-    # Valid -> hapus biar sekali pakai
     run_query("DELETE FROM otp_codes WHERE email = %s AND purpose = %s", (email, purpose))
     return True
 
@@ -137,13 +138,12 @@ async def send_email(subject: str, recipients: list[str], html_body: str):
 
 
 # =========================================================================
-# APP
+# APP & MODELS
 # =========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     yield
-
 
 app = FastAPI(title="Notes API", lifespan=lifespan)
 
@@ -156,40 +156,31 @@ app.add_middleware(
 )
 
 
-# =========================================================================
-# MODELS (sesuaikan nama field dengan yang dikirim Android/Retrofit)
-# =========================================================================
 class SignupRequest(BaseModel):
     full_name: str
     email: EmailStr
     javaPassword: str
 
-
 class LoginRequest(BaseModel):
     email: EmailStr
     javaPassword: str
-
 
 class VerifyOtpRequest(BaseModel):
     email: EmailStr
     otp: str
 
-
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
-
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
     otp: str
     newPassword: str
 
-
 class ChangePasswordRequest(BaseModel):
     email: EmailStr
     oldPassword: str
     newPassword: str
-
 
 class FeedbackRequest(BaseModel):
     email: EmailStr
@@ -198,16 +189,13 @@ class FeedbackRequest(BaseModel):
 
 
 # =========================================================================
-# HEALTH CHECK
+# ENDPOINTS
 # =========================================================================
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Notes API is running"}
 
 
-# =========================================================================
-# 1. SIGN UP  ->  kirim OTP
-# =========================================================================
 @app.post("/signup")
 async def signup(req: SignupRequest):
     try:
@@ -217,9 +205,10 @@ async def signup(req: SignupRequest):
         if existing and existing[0] is True:
             return {"status": "error", "message": "Email sudah terdaftar!"}
 
-        hashed = pwd_context.hash(req.javaPassword)
+        # Menggunakan helper manual untuk bypass error passlib
+        hashed = hash_password(req.javaPassword)
 
-        if existing:  # ada tapi belum verifikasi -> update datanya
+        if existing:
             run_query(
                 "UPDATE users SET full_name = %s, password = %s WHERE email = %s",
                 (req.full_name, hashed, req.email),
@@ -248,9 +237,6 @@ async def signup(req: SignupRequest):
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 2. VERIFY OTP SIGN UP
-# =========================================================================
 @app.post("/verify-otp")
 def verify_signup(req: VerifyOtpRequest):
     try:
@@ -262,9 +248,6 @@ def verify_signup(req: VerifyOtpRequest):
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 3. LOGIN
-# =========================================================================
 @app.post("/login")
 def login(req: LoginRequest):
     try:
@@ -277,7 +260,8 @@ def login(req: LoginRequest):
             return {"status": "error", "message": "Email atau Password salah!"}
 
         hashed, is_verified = row
-        if not pwd_context.verify(req.javaPassword, hashed):
+        # Menggunakan helper manual
+        if not verify_password(req.javaPassword, hashed):
             return {"status": "error", "message": "Email atau Password salah!"}
         if not is_verified:
             return {"status": "error", "message": "Akun belum diverifikasi. Cek email OTP."}
@@ -287,9 +271,6 @@ def login(req: LoginRequest):
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 4. FORGOT PASSWORD  ->  kirim OTP reset
-# =========================================================================
 @app.post("/forgot-password")
 async def forgot_password(req: ForgotPasswordRequest):
     try:
@@ -298,7 +279,6 @@ async def forgot_password(req: ForgotPasswordRequest):
             (req.email,),
             fetch="one",
         )
-        # Pesan generik biar email orang lain nggak bisa ditebak-tebak
         generic = {"status": "success", "message": "Jika email terdaftar, OTP reset sudah dikirim."}
         if not user:
             return generic
@@ -319,24 +299,18 @@ async def forgot_password(req: ForgotPasswordRequest):
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 5. RESET PASSWORD
-# =========================================================================
 @app.post("/reset-password")
 def reset_password(req: ResetPasswordRequest):
     try:
         if not verify_otp(req.email, req.otp, "reset"):
             return {"status": "error", "message": "OTP salah atau sudah kedaluwarsa."}
-        hashed = pwd_context.hash(req.newPassword)
+        hashed = hash_password(req.newPassword)
         run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email))
         return {"status": "success", "message": "Password berhasil diubah."}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 6. CHANGE PASSWORD (user sedang login, tahu password lama)
-# =========================================================================
 @app.post("/change-password")
 def change_password(req: ChangePasswordRequest):
     try:
@@ -347,19 +321,16 @@ def change_password(req: ChangePasswordRequest):
         )
         if not row:
             return {"status": "error", "message": "User tidak ditemukan."}
-        if not pwd_context.verify(req.oldPassword, row[0]):
+        if not verify_password(req.oldPassword, row[0]):
             return {"status": "error", "message": "Password lama salah!"}
 
-        hashed = pwd_context.hash(req.newPassword)
+        hashed = hash_password(req.newPassword)
         run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email))
         return {"status": "success", "message": "Password berhasil diubah."}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
 
 
-# =========================================================================
-# 7. FEEDBACK  ->  diteruskan ke email admin
-# =========================================================================
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
     try:
