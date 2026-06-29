@@ -4,3 +4,5 @@ pydantic[email]
 psycopg2-binary
 bcrypt
 fastapi-mail
+gspread
+google-auth

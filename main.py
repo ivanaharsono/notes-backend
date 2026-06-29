@@ -1,9 +1,12 @@
 import os
 import secrets
+import json
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 
 import psycopg2
+import gspread
+from google.oauth2.service_account import Credentials
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -16,6 +19,7 @@ from fastapi_mail import FastMail, MessageSchema, ConnectionConfig, MessageType
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
 OTP_EXPIRE_MINUTES = 5
+GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 
 mail_conf = ConnectionConfig(
     MAIL_USERNAME=os.environ.get("MAIL_USERNAME"),
@@ -135,6 +139,31 @@ async def send_email(subject: str, recipients: list[str], html_body: str):
         subtype=MessageType.html,
     )
     await fm.send_message(message)
+
+
+def append_to_google_sheet(name: str, email: str, message: str):
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON belum disetting di Vercel Env!")
+        
+    # Scope yang dibutuhkan untuk akses Google Sheets dan Drive
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
+    # Load kredensial langsung dari string JSON environment variable
+    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    
+    # GANTI "Feedback Notes Android" dengan nama file Google Sheets asli lu di Drive jika berbeda!
+    sheet = client.open("Feedback Notes Android").sheet1
+    
+    # Ambil waktu lokal saat feedback dikirim
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Masukkan data sebagai baris baru (Timestamp, Nama, Email, Pesan)
+    sheet.append_row([current_time, name, email, message])
 
 
 # =========================================================================
@@ -334,20 +363,15 @@ def change_password(req: ChangePasswordRequest):
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
     try:
-        if not ADMIN_EMAIL:
-            return {"status": "error", "message": "ADMIN_EMAIL belum disetting."}
         sender_name = req.name or "Anonim"
-        await send_email(
-            subject=f"[Feedback Notes] dari {sender_name}",
-            recipients=[ADMIN_EMAIL],
-            html_body=f"""
-                <h3>Feedback baru</h3>
-                <p><b>Nama:</b> {sender_name}</p>
-                <p><b>Email:</b> {req.email}</p>
-                <p><b>Pesan:</b></p>
-                <p>{req.message}</p>
-            """,
+        
+        # Jalankan fungsi gspread untuk memasukkan data ke baris spreadsheet
+        append_to_google_sheet(
+            name=sender_name,
+            email=req.email,
+            message=req.message
         )
-        return {"status": "success", "message": "Feedback terkirim. Terima kasih!"}
+        
+        return {"status": "success", "message": "Feedback berhasil disimpan ke Google Sheets!"}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
