@@ -229,7 +229,7 @@ def root():
 async def signup(req: SignupRequest):
     try:
         existing = run_query(
-            "SELECT is_verified FROM users WHERE email = %s", (req.email,), fetch="one"
+            "SELECT is_verified FROM users WHERE email = %s", (req.email.lower(),), fetch="one"
         )
         if existing and existing[0] is True:
             return {"status": "error", "message": "Email sudah terdaftar!"}
@@ -240,19 +240,19 @@ async def signup(req: SignupRequest):
         if existing:
             run_query(
                 "UPDATE users SET full_name = %s, password = %s WHERE email = %s",
-                (req.full_name, hashed, req.email),
+                (req.full_name, hashed, req.email.lower()),
             )
         else:
             run_query(
                 "INSERT INTO users (full_name, email, password, is_verified) "
                 "VALUES (%s, %s, %s, FALSE)",
-                (req.full_name, req.email, hashed),
+                (req.full_name, req.email.lower(), hashed),
             )
 
-        code = save_otp(req.email, "signup")
+        code = save_otp(req.email.lower(), "signup")
         await send_email(
             subject="Kode OTP Pendaftaran Notes",
-            recipients=[req.email],
+            recipients=[req.email.lower()],
             html_body=f"""
                 <h3>Halo {req.full_name},</h3>
                 <p>Kode OTP pendaftaran kamu:</p>
@@ -269,9 +269,9 @@ async def signup(req: SignupRequest):
 @app.post("/verify-otp")
 def verify_signup(req: VerifyOtpRequest):
     try:
-        if not verify_otp(req.email, req.otp, "signup"):
+        if not verify_otp(req.email.lower(), req.otp, "signup"):
             return {"status": "error", "message": "OTP salah atau sudah kedaluwarsa."}
-        run_query("UPDATE users SET is_verified = TRUE WHERE email = %s", (req.email,))
+        run_query("UPDATE users SET is_verified = TRUE WHERE email = %s", (req.email.lower(),))
         return {"status": "success", "message": "Verifikasi berhasil! Akun aktif."}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
@@ -282,7 +282,7 @@ def login(req: LoginRequest):
     try:
         row = run_query(
             "SELECT password, is_verified FROM users WHERE email = %s",
-            (req.email,),
+            (req.email.lower(),),
             fetch="one",
         )
         if not row:
@@ -305,17 +305,17 @@ async def forgot_password(req: ForgotPasswordRequest):
     try:
         user = run_query(
             "SELECT full_name FROM users WHERE email = %s AND is_verified = TRUE",
-            (req.email,),
+            (req.email.lower(),),
             fetch="one",
         )
         generic = {"status": "success", "message": "Jika email terdaftar, OTP reset sudah dikirim."}
         if not user:
             return generic
 
-        code = save_otp(req.email, "reset")
+        code = save_otp(req.email.lower(), "reset")
         await send_email(
             subject="Kode OTP Reset Password Notes",
-            recipients=[req.email],
+            recipients=[req.email.lower()],
             html_body=f"""
                 <h3>Halo {user[0]},</h3>
                 <p>Kode OTP untuk reset password:</p>
@@ -331,10 +331,10 @@ async def forgot_password(req: ForgotPasswordRequest):
 @app.post("/reset-password")
 def reset_password(req: ResetPasswordRequest):
     try:
-        if not verify_otp(req.email, req.otp, "reset"):
+        if not verify_otp(req.email.lower(), req.otp, "reset"):
             return {"status": "error", "message": "OTP salah atau sudah kedaluwarsa."}
         hashed = hash_password(req.newPassword)
-        run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email))
+        run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email.lower()))
         return {"status": "success", "message": "Password berhasil diubah."}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
@@ -345,7 +345,7 @@ def change_password(req: ChangePasswordRequest):
     try:
         row = run_query(
             "SELECT password FROM users WHERE email = %s AND is_verified = TRUE",
-            (req.email,),
+            (req.email.lower(),),
             fetch="one",
         )
         if not row:
@@ -354,7 +354,7 @@ def change_password(req: ChangePasswordRequest):
             return {"status": "error", "message": "Password lama salah!"}
 
         hashed = hash_password(req.newPassword)
-        run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email))
+        run_query("UPDATE users SET password = %s WHERE email = %s", (hashed, req.email.lower()))
         return {"status": "success", "message": "Password berhasil diubah."}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
@@ -363,15 +363,23 @@ def change_password(req: ChangePasswordRequest):
 @app.post("/feedback")
 async def feedback(req: FeedbackRequest):
     try:
-        sender_name = req.name or "Anonim"
+        email_clean = req.email.lower()
         
-        # Jalankan fungsi gspread untuk memasukkan data ke baris spreadsheet
+        # Cari nama asli user di database Neon berdasarkan email
+        user_data = run_query(
+            "SELECT full_name FROM users WHERE email = %s", (email_clean,), fetch="one"
+        )
+        
+        # Kalau user-nya ketemu di DB, pakai nama aslinya. Kalau kagak (misal akun testing), pakai fallback.
+        sender_name = user_data[0] if user_data else "User Tidak Terdaftar"
+        
+        # Google Sheets
         append_to_google_sheet(
             name=sender_name,
-            email=req.email,
+            email=email_clean,
             message=req.message
         )
         
-        return {"status": "success", "message": "Feedback berhasil disimpan ke Google Sheets!"}
+        return {"status": "success", "message": "Feedback berhasil disimpan!"}
     except Exception as e:
         return {"status": "error", "message": f"Server error: {str(e)}"}
